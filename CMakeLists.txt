@@ -18,6 +18,7 @@ option(WITH_HTTP_SERVER "compile http/server" ON)
 option(WITH_HTTP_CLIENT "compile http/client" ON)
 option(WITH_MQTT "compile mqtt" OFF)
 option(WITH_REDIS "compile redis" OFF)
+option(WITH_RPC "compile hrpc (libhrpc, needs protobuf)" OFF)
 
 option(ENABLE_UDS "Unix Domain Socket" OFF)
 option(USE_MULTIMAP "MultiMap" OFF)
@@ -223,6 +224,12 @@ elseif(UNIX AND NOT MINGW)
     if(RT_LIBRARY)
         set(LIBS ${LIBS} rt)
     endif()
+    # Some platforms (e.g. 32-bit ARM / Raspberry Pi) need libatomic for
+    # 64-bit atomics; link it only when available. See issue #384.
+    find_library(ATOMIC_LIBRARY atomic)
+    if(ATOMIC_LIBRARY)
+        set(LIBS ${LIBS} atomic)
+    endif()
 endif()
 
 if(APPLE)
@@ -341,6 +348,12 @@ endif()
 
 install(FILES ${LIBHV_HEADERS} DESTINATION include/hv)
 install(EXPORT libhvConfig DESTINATION lib/cmake/libhv)
+
+# hrpc: TLV + protobuf RPC, built as a separate library (libhrpc) so libhv
+# stays protobuf-free. See rpc/CMakeLists.txt. Must precede examples (they link hrpc).
+if(WITH_RPC)
+    add_subdirectory(rpc)
+endif()
 
 if(BUILD_SHARED)
     set(HV_LIBRARIES hv CACHE INTERNAL "link hv libraries")

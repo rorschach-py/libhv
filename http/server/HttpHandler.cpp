@@ -81,6 +81,39 @@ bool HttpHandler::Init(int http_version) {
         tid = hloop_tid(loop);
         writer = std::make_shared<HttpResponseWriter>(io, resp);
         writer->status = hv::SocketChannel::CONNECTED;
+        if (protocol == HTTP_V2) {
+            // Async handlers run on a worker thread but the nghttp2 session is
+            // not thread-safe, so the writer posts the h2 response submit back
+            // to this io's loop thread (hloop_post_event is thread-safe).
+            // Capture hio_id too: a fd (hence hio_t*) can be reused by a new
+            // connection after close, so verify the id still matches before
+            // touching the handler, otherwise a late post could send this
+            // response over a different connection.
+            hio_t* hio = io;
+            uint32_t hid = hio_id(io);
+            writer->submitHttp2Response = [hio, hid]() {
+                hloop_t* loop = hevent_loop(hio);
+                hevent_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.loop = loop;
+                ev.userdata = hio;
+                ev.event_id = hid;   // carry the captured hio id for validation
+                ev.cb = [](hevent_t* ev) {
+                    hio_t* io = (hio_t*)ev->userdata;
+                    // stale post: fd was reused by another connection after close
+                    if (hio_id(io) != ev->event_id) return;
+                    // handler is stored as the io userdata; NULL after close.
+                    HttpHandler* handler = (HttpHandler*)hevent_userdata(io);
+                    if (handler && handler->parser) {
+                        // async left state at HANDLE_CONTINUE; move to WANT_SEND
+                        // so GetSendData drives the h2 send instead of bailing.
+                        handler->state = WANT_SEND;
+                        handler->SendHttpResponse();
+                    }
+                };
+                hloop_post_event(loop, &ev);
+            };
+        }
     } else {
         pid = hv_getpid();
         tid = hv_gettid();
@@ -516,7 +549,7 @@ postprocessor:
         }
     }
 
-    if (writer && writer->state != hv::HttpResponseWriter::SEND_BEGIN) {
+    if (writer && !writer->isBegin()) {
         status_code = HTTP_STATUS_NEXT;
     }
     if (status_code == HTTP_STATUS_NEXT) {
@@ -744,6 +777,18 @@ int HttpHandler::FeedRecvData(const char* data, size_t len) {
     case HttpHandler::HTTP_V1:
     case HttpHandler::HTTP_V2:
         if (state != WANT_RECV) {
+            // A new request arrived on this connection before the previous one
+            // finished. Reset() reuses the same req/resp objects, so if an async
+            // handler on another thread is still producing/sending the previous
+            // response (writer not yet End()ed), resetting here races that thread
+            // and can crash. In that case reject the pipelined/early data and let
+            // the caller close the connection. Otherwise (response already sent)
+            // it is safe to reset for the next keep-alive request.
+            if (writer && !writer->isEnd()) {
+                hloge("[%s:%d] new request while previous async response is still in flight", ip, port);
+                error = ERR_REQUEST;
+                return -1;
+            }
             Reset();
         }
         nfeed = parser->FeedRecvData(data, len);
@@ -752,6 +797,19 @@ int HttpHandler::FeedRecvData(const char* data, size_t len) {
             hloge("[%s:%d] http parse error: %s", ip, port, parser->StrError(parser->GetError()));
             error = ERR_PARSE;
             return -1;
+        }
+        // HTTP2: flush frames nghttp2 queued while consuming this input --
+        // SETTINGS/PING ACK, WINDOW_UPDATE, and DATA that was deferred by flow
+        // control until the peer's WINDOW_UPDATE just arrived. Without this a
+        // response body larger than the stream window (64KB) would stall.
+        // Drives the parser directly (not the send-state machine) so it is safe
+        // on the recv path.
+        if (protocol == HttpHandler::HTTP_V2 && io && parser) {
+            char* sdata = NULL;
+            size_t slen = 0;
+            while (parser->GetSendData(&sdata, &slen) > 0) {
+                if (sdata && slen) hio_write(io, sdata, slen);
+            }
         }
         break;
     case HttpHandler::WEBSOCKET:
@@ -810,11 +868,18 @@ int HttpHandler::GetSendData(char** data, size_t* len) {
                 // FileCache
                 // NOTE: no copy filebuf, more efficient
                 header = pResp->Dump(true, false);
-                fc->prepend_header(header.c_str(), header.size());
-                *data = fc->httpbuf.base;
-                *len = fc->httpbuf.len;
-                state = SEND_DONE;
-                return *len;
+                if (fc->prepend_header(header.c_str(), header.size())) {
+                    // header fit the reserved space: send header + file content
+                    // as one buffer.
+                    *data = fc->httpbuf.base;
+                    *len = fc->httpbuf.len;
+                    state = SEND_DONE;
+                    return *len;
+                }
+                // header too large for the reserved space: send the header now,
+                // then the file content (pResp->content points at fc->filebuf).
+                state = SEND_BODY;
+                goto return_header;
             }
             // API service
             content_length = pResp->ContentLength();
